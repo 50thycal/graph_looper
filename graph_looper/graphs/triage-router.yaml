@@ -1,0 +1,82 @@
+name: triage-router
+description: >-
+  A loop-free shape for contrast: one classifier gate fanning out to three
+  specialists, each writing into the same reply.
+
+defaults:
+  model: claude-opus-5
+  effort: low
+
+nodes:
+  - id: ticket
+    type: input
+    title: Incoming ticket
+
+  - id: classify
+    type: gate
+    title: What kind of ticket
+    choices: [bug, billing, question]
+    max_visits: 1
+    on_exhausted: question
+    prompt: |
+      Ticket:
+      {{ task }}
+
+      Classify it. "bug" is something broken, "billing" is anything about money
+      or accounts, "question" is everything else.
+
+  - id: bug_handler
+    type: agent
+    title: Bug triage
+    prompt: |
+      Ticket:
+      {{ task }}
+
+      Write the engineering triage note: the suspected component, the severity
+      (S1-S4) with a one-line justification, and the reproduction steps you
+      would ask the reporter for.
+
+  - id: billing_handler
+    type: agent
+    title: Billing
+    prompt: |
+      Ticket:
+      {{ task }}
+
+      Write the billing response: what the customer is owed or charged, the
+      action to take, and whether a human needs to approve it.
+
+  - id: question_handler
+    type: agent
+    title: Answer
+    prompt: |
+      Ticket:
+      {{ task }}
+
+      Answer the question directly in under 120 words. If it cannot be answered
+      without information you do not have, say exactly what to ask for.
+
+  - id: reply
+    type: output
+    title: Reply
+    join: any
+    prompt: "{{ input }}"
+
+edges:
+  - from: ticket
+    to: classify
+  - from: classify
+    to: bug_handler
+    when: bug
+  - from: classify
+    to: billing_handler
+    when: billing
+  - from: classify
+    to: question_handler
+    when: question
+  - from: bug_handler
+    to: reply
+  - from: billing_handler
+    to: reply
+  - from: question_handler
+    to: reply

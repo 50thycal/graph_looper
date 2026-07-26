@@ -1,0 +1,226 @@
+name: reviewer-loop
+description: >-
+  Plan, build, review in parallel, synthesise, gate, and loop back on failure —
+  with an independent plan reviewer running alongside the whole time.
+
+defaults:
+  model: claude-opus-5
+  effort: high
+  max_tokens: 8000
+  max_visits: 3
+  system: >-
+    You are one node in a multi-agent workflow. Do your own job precisely and
+    hand off cleanly. Do not narrate, do not restate the task, do not apologise.
+
+limits:
+  max_steps: 60
+  max_parallel: 6
+
+nodes:
+  - id: task
+    type: input
+    title: Task
+
+  - id: planner
+    type: agent
+    title: Planner
+    join: any
+    prompt: |
+      Task: {{ task }}
+
+      {{ results.plan_reviewer }}
+
+      Write a short plan for completing this task: the deliverable's shape, the
+      three to five steps to get there, and the constraints that must hold.
+      If plan feedback appears above, this is a revision — address it directly.
+
+      Output the plan as a numbered list. No preamble.
+
+  - id: plan_reviewer
+    type: agent
+    title: Independent plan reviewer
+    prompt: |
+      Task: {{ task }}
+
+      Proposed plan:
+      {{ inputs.planner }}
+
+      You review plans, not output. Judge only whether following this plan would
+      satisfy the task. Name any step that is missing, redundant, or that would
+      produce the wrong shape of deliverable.
+
+      Be brief: at most four bullets, or the single line "Plan is sound." if it is.
+
+  - id: plan_approved
+    type: gate
+    title: Plan approved
+    choices: [approve, revise]
+    max_visits: 2
+    on_exhausted: approve
+    prompt: |
+      Plan:
+      {{ results.planner }}
+
+      Review:
+      {{ inputs.plan_reviewer }}
+
+      Choose "revise" only if the review names a concrete flaw that would cause
+      the task to be missed. Style preferences and nice-to-haves are "approve".
+
+  - id: worker
+    type: agent
+    title: Worker
+    mode: resident
+    join: any
+    prompt: |
+      Task: {{ task }}
+
+      Plan:
+      {{ results.planner }}
+
+      Reviewer feedback on your previous attempt (blank on the first attempt):
+      {{ results.synthesize }}
+
+      This is attempt {{ iteration }}. Produce the deliverable itself — no
+      commentary, no explanation of your changes.
+
+  - id: reviewer_structure
+    type: agent
+    title: Reviewer 1 — structure
+    prompt: |
+      Task: {{ task }}
+
+      Submission:
+      {{ inputs.worker }}
+
+      Review the structure only: is it the right form of artefact, is it
+      complete, is anything out of order or missing? Ignore wording and ignore
+      whether the content is correct.
+
+      Reply with "PASS" or "FAIL", then the specific problems as bullets.
+
+  - id: reviewer_correctness
+    type: agent
+    title: Reviewer 2 — correctness
+    prompt: |
+      Task: {{ task }}
+
+      Submission:
+      {{ inputs.worker }}
+
+      Review correctness only: are the claims, facts, logic, and any code or
+      arithmetic right? Ignore structure and style.
+
+      Reply with "PASS" or "FAIL", then each error you found as a bullet, each
+      one quoting the text it applies to.
+
+  - id: reviewer_fidelity
+    type: agent
+    title: Reviewer 3 — task fidelity
+    prompt: |
+      Task: {{ task }}
+
+      Submission:
+      {{ inputs.worker }}
+
+      Review fidelity only: does this answer the task as asked — every part of
+      it, at the requested scope, in the requested form? Work that is good but
+      answers a different question fails.
+
+      Reply with "PASS" or "FAIL", then the specific gaps as bullets.
+
+  - id: synthesize
+    type: agent
+    title: Synthesise feedback
+    prompt: |
+      Three reviewers looked at the same submission.
+
+      {{ input }}
+
+      Merge these into one actionable list for the worker. Drop duplicates, drop
+      anything subjective, and drop anything a reviewer raised outside its remit.
+      Order by how much it matters.
+
+      Start with a line "VERDICT: PASS" or "VERDICT: FAIL", then the list. If
+      every reviewer passed, write the verdict line alone.
+
+  - id: checks_pass
+    type: gate
+    title: All checks pass
+    choices: [pass, fail]
+    max_visits: 3
+    on_exhausted: pass
+    prompt: |
+      Synthesised review:
+      {{ inputs.synthesize }}
+
+      Choose "pass" if the verdict is PASS or only cosmetic points remain.
+      Choose "fail" if any reviewer found something that must be fixed.
+
+  - id: haiku
+    type: agent
+    title: Turn into haiku
+    prompt: |
+      {{ results.worker }}
+
+      Distil the work above into a single haiku: three lines, 5-7-5 syllables.
+      Output the three lines and nothing else.
+
+  - id: send
+    type: output
+    title: Send to user
+    prompt: |
+      {{ inputs.haiku }}
+
+      ---
+
+      {{ results.worker }}
+
+edges:
+  - from: task
+    to: planner
+
+  - from: planner
+    to: worker
+  - from: planner
+    to: plan_reviewer
+
+  - from: plan_reviewer
+    to: plan_approved
+  - from: plan_approved
+    to: planner
+    when: revise
+    label: revise plan
+  - from: plan_approved
+    to: send
+    when: approve
+
+  - from: worker
+    to: reviewer_structure
+    label: "1"
+  - from: worker
+    to: reviewer_correctness
+    label: "2"
+  - from: worker
+    to: reviewer_fidelity
+    label: N
+
+  - from: reviewer_structure
+    to: synthesize
+  - from: reviewer_correctness
+    to: synthesize
+  - from: reviewer_fidelity
+    to: synthesize
+
+  - from: synthesize
+    to: checks_pass
+  - from: checks_pass
+    to: worker
+    when: fail
+    label: return feedback
+  - from: checks_pass
+    to: haiku
+    when: pass
+
+  - from: haiku
+    to: send

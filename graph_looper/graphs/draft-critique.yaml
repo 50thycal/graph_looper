@@ -1,0 +1,74 @@
+name: draft-critique
+description: >-
+  The smallest useful loop: a resident writer and an ephemeral critic, trading
+  drafts until a gate says it is good enough.
+
+defaults:
+  model: claude-opus-5
+  effort: medium
+  max_visits: 3
+
+nodes:
+  - id: brief
+    type: input
+    title: Brief
+
+  - id: writer
+    type: agent
+    title: Writer
+    mode: resident
+    join: any
+    prompt: |
+      Brief: {{ task }}
+
+      Critique of your last draft (blank on the first pass):
+      {{ results.critic }}
+
+      Write the next draft. Output the draft only.
+
+  - id: critic
+    type: agent
+    title: Critic
+    prompt: |
+      Brief: {{ task }}
+
+      Draft:
+      {{ inputs.writer }}
+
+      Name the three things most worth fixing, most important first. If the
+      draft meets the brief, say "Ship it." and nothing else.
+
+  - id: good_enough
+    type: gate
+    title: Good enough
+    choices: [ship, revise]
+    max_visits: 3
+    on_exhausted: ship
+    prompt: |
+      Brief: {{ task }}
+
+      Critique of the current draft:
+      {{ inputs.critic }}
+
+      Choose "ship" if the critique is only preference or polish. Choose
+      "revise" if it names something that fails the brief.
+
+  - id: final
+    type: output
+    title: Final draft
+    prompt: "{{ results.writer }}"
+
+edges:
+  - from: brief
+    to: writer
+  - from: writer
+    to: critic
+  - from: critic
+    to: good_enough
+  - from: good_enough
+    to: writer
+    when: revise
+    label: revise
+  - from: good_enough
+    to: final
+    when: ship
