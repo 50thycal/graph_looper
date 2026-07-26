@@ -98,3 +98,9 @@ def loop_graph():
 @pytest.fixture
 def fanout_graph():
     return load_graph_str(FANOUT)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_graph_path(monkeypatch):
+    """Keep a developer's own GRAPHLOOPER_PATH out of the test run."""
+    monkeypatch.delenv("GRAPHLOOPER_PATH", raising=False)

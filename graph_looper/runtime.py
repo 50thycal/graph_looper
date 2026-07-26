@@ -17,8 +17,9 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-from graph_looper import template
+from graph_looper import predicate, template
 from graph_looper.providers import (
+    AnthropicProvider,
     LLMRequest,
     LLMResponse,
     Provider,
@@ -26,6 +27,7 @@ from graph_looper.providers import (
     choice_schema,
 )
 from graph_looper.spec import Graph, Node
+from graph_looper.state import StateError, StateStore, record, resolve_store
 
 
 class RunError(RuntimeError):
@@ -40,6 +42,9 @@ class NodeResult:
     data: dict[str, Any] | None = None
     label: str | None = None
     forced: bool = False
+    #: How the result was produced: `model`, `predicate`, `forced`, or `local`.
+    #: Anything other than `model` cost no tokens.
+    via: str = "model"
     seconds: float = 0.0
     input_tokens: int = 0
     output_tokens: int = 0
@@ -49,6 +54,7 @@ class NodeResult:
             "node": self.node_id,
             "visit": self.visit,
             "text": self.text,
+            "via": self.via,
             "seconds": round(self.seconds, 3),
         }
         if self.data is not None:
@@ -138,7 +144,42 @@ class RunResult:
     seconds: float
     input_tokens: int = 0
     output_tokens: int = 0
+    #: Per-node totals accumulated across every visit, keyed by node id, each
+    #: holding `calls`, `model_calls`, `input`, `output`.
+    usage_by_node: dict[str, dict[str, int]] = field(default_factory=dict)
+    #: State as it stands after the run, including anything nodes wrote.
+    state: dict[str, Any] = field(default_factory=dict)
     error: str | None = None
+
+    @property
+    def total_tokens(self) -> int:
+        return self.input_tokens + self.output_tokens
+
+    def text_of(self, node_id: str, default: str = "") -> str:
+        """The latest text a node produced, or *default* if it never ran."""
+        result = self.results.get(node_id)
+        return result.text if result else default
+
+    def data_of(self, node_id: str) -> dict[str, Any] | None:
+        """The latest structured output of a node, if it had a schema."""
+        result = self.results.get(node_id)
+        return result.data if result else None
+
+    def costliest(self, limit: int = 5) -> list[tuple[str, dict[str, int]]]:
+        """Nodes ordered by tokens spent — which one is the pile."""
+        ranked = sorted(
+            self.usage_by_node.items(),
+            key=lambda kv: kv[1]["input"] + kv[1]["output"],
+            reverse=True,
+        )
+        return ranked[:limit]
+
+    def raise_for_status(self) -> "RunResult":
+        """Raise `RunError` if the run failed. Handy for calling code that
+        would rather have an exception than check a flag."""
+        if not self.ok:
+            raise RunError(self.error or "run failed")
+        return self
 
     def to_dict(self, *, include_trace: bool = True) -> dict[str, Any]:
         out: dict[str, Any] = {
@@ -150,8 +191,11 @@ class RunResult:
             "steps": self.steps,
             "seconds": round(self.seconds, 3),
             "tokens": {"input": self.input_tokens, "output": self.output_tokens},
+            "usage_by_node": self.usage_by_node,
             "results": {k: v.to_dict() for k, v in self.results.items()},
         }
+        if self.state:
+            out["state"] = self.state
         if self.error:
             out["error"] = self.error
         if include_trace:
@@ -165,12 +209,26 @@ class Runner:
     def __init__(
         self,
         graph: Graph,
-        provider: Provider,
+        provider: Provider | None = None,
         *,
+        state: Any = None,
+        namespace: str | None = None,
         on_event: Callable[[TraceEvent], None] | None = None,
     ) -> None:
+        """
+        Args:
+            graph: the workflow to execute.
+            provider: where model calls go. Defaults to `AnthropicProvider()`.
+            state: persistence between runs — a `StateStore`, a path, `True` for
+                the default file, or `None` for no memory at all.
+            namespace: the key state is filed under. Defaults to the graph name,
+                so one store can back many graphs.
+            on_event: called with each `TraceEvent` as it happens.
+        """
         self.graph = graph
-        self.provider = provider
+        self.provider = provider if provider is not None else AnthropicProvider()
+        self.store: StateStore = resolve_store(state)
+        self.namespace = namespace or graph.name
         self.on_event = on_event
 
     def run(self, task: str, **overrides: Any) -> RunResult:
@@ -185,8 +243,10 @@ class Runner:
         mailboxes: dict[int, list[NodeResult]] = {i: [] for i in range(len(graph.edges))}
         visits: dict[str, int] = {n.id: 0 for n in graph.nodes}
         results: dict[str, NodeResult] = {}
+        usage: dict[str, dict[str, int]] = {}
         conversations: dict[str, list[dict[str, Any]]] = {}
         merged_vars = {**graph.vars, **(variables or {})}
+        state = self.store.load(self.namespace)
 
         pending_inputs = [n for n in graph.inputs()]
         started = time.monotonic()
@@ -231,6 +291,7 @@ class Runner:
                             variables=merged_vars,
                             visits=visits,
                             results=results,
+                            state=state,
                             conversations=conversations,
                             trace=trace,
                             semaphore=semaphore,
@@ -242,7 +303,16 @@ class Runner:
                 terminal: NodeResult | None = None
                 for result in fired:
                     results[result.node_id] = result
+                    self._tally(usage, result)
                     node = graph.node(result.node_id)
+                    if node.writes_state:
+                        record(
+                            state,
+                            node.writes_state,
+                            result.data if result.data is not None else result.text,
+                            append=node.state_append,
+                            limit=node.state_limit,
+                        )
                     if node.type == "output":
                         if terminal is None:
                             terminal = result
@@ -259,6 +329,19 @@ class Runner:
             self._emit(trace, "error", detail={"message": error})
 
         seconds = time.monotonic() - started
+
+        # Persist even on failure: a run that died halfway still learned
+        # whatever its completed nodes wrote.
+        state["_runs"] = int(state.get("_runs", 0)) + 1
+        state["_last_ok"] = error is None
+        state["_last_output"] = output_text
+        if error:
+            state["_last_error"] = error
+        try:
+            self.store.save(self.namespace, state)
+        except StateError as exc:
+            self._emit(trace, "warning", detail={"message": f"state not saved: {exc}"})
+
         self._emit(
             trace,
             "run_end",
@@ -276,10 +359,24 @@ class Runner:
             trace=trace,
             steps=steps,
             seconds=seconds,
-            input_tokens=sum(r.input_tokens for r in results.values()),
-            output_tokens=sum(r.output_tokens for r in results.values()),
+            input_tokens=sum(u["input"] for u in usage.values()),
+            output_tokens=sum(u["output"] for u in usage.values()),
+            usage_by_node=usage,
+            state=state,
             error=error,
         )
+
+    @staticmethod
+    def _tally(usage: dict[str, dict[str, int]], result: NodeResult) -> None:
+        """Accumulate across every visit — a node in a loop bills more than once."""
+        entry = usage.setdefault(
+            result.node_id, {"calls": 0, "model_calls": 0, "input": 0, "output": 0}
+        )
+        entry["calls"] += 1
+        if result.via == "model":
+            entry["model_calls"] += 1
+        entry["input"] += result.input_tokens
+        entry["output"] += result.output_tokens
 
     # -- scheduling ---------------------------------------------------------
 
@@ -369,6 +466,7 @@ class Runner:
         variables: dict[str, Any],
         visits: dict[str, int],
         results: dict[str, NodeResult],
+        state: dict[str, Any],
         conversations: dict[str, list[dict[str, Any]]],
         trace: Trace,
         semaphore: asyncio.Semaphore,
@@ -391,7 +489,7 @@ class Runner:
                 "raise its max_visits or tighten the loop that feeds it"
             )
 
-        context = self._context(node, inbox, task, variables, results, visit)
+        context = self._context(node, inbox, task, variables, results, state, visit)
 
         if node.type == "gate" and visit > cap:
             result = NodeResult(
@@ -404,13 +502,42 @@ class Runner:
                 data={"choice": node.on_exhausted, "reason": "visit budget exhausted"},
                 label=node.on_exhausted,
                 forced=True,
+                via="forced",
                 seconds=time.monotonic() - started,
             )
+        elif node.type == "gate" and node.gate_mode == "predicate":
+            decision = self._decide(node, context)
+            if decision is None:
+                # Nothing matched and no default — escalate to the model.
+                async with semaphore:
+                    response = await self._call_model(node, context, conversations, visit)
+                result = NodeResult(
+                    node_id=node.id,
+                    text=response.text,
+                    visit=visit,
+                    data=response.data,
+                    via="model",
+                    seconds=time.monotonic() - started,
+                    input_tokens=response.input_tokens,
+                    output_tokens=response.output_tokens,
+                )
+                result.label = self._label_for(node, response.text, response.data)
+            else:
+                result = NodeResult(
+                    node_id=node.id,
+                    text=decision.reason,
+                    visit=visit,
+                    data={"choice": decision.choice, "reason": decision.reason},
+                    label=decision.choice,
+                    via="predicate",
+                    seconds=time.monotonic() - started,
+                )
         elif node.type == "input":
             result = NodeResult(
                 node_id=node.id,
                 text=template.render(node.prompt, context) if node.prompt else task,
                 visit=visit,
+                via="local",
                 seconds=time.monotonic() - started,
             )
         elif node.type == "transform":
@@ -418,6 +545,7 @@ class Runner:
                 node_id=node.id,
                 text=self._transform(node, inbox, context),
                 visit=visit,
+                via="local",
                 seconds=time.monotonic() - started,
             )
             result.label = self._label_for(node, result.text, None)
@@ -428,7 +556,11 @@ class Runner:
                 else self._joined(inbox)
             )
             result = NodeResult(
-                node_id=node.id, text=text, visit=visit, seconds=time.monotonic() - started
+                node_id=node.id,
+                text=text,
+                visit=visit,
+                via="local",
+                seconds=time.monotonic() - started,
             )
         else:
             async with semaphore:
@@ -438,6 +570,7 @@ class Runner:
                 text=response.text,
                 visit=visit,
                 data=response.data,
+                via="model",
                 seconds=time.monotonic() - started,
                 input_tokens=response.input_tokens,
                 output_tokens=response.output_tokens,
@@ -452,11 +585,25 @@ class Runner:
                 "visit": visit,
                 "label": result.label,
                 "forced": result.forced,
+                "via": result.via,
                 "seconds": round(result.seconds, 3),
                 "preview": _preview(result.text),
             },
         )
         return result
+
+    def _decide(self, node: Node, context: dict[str, Any]) -> predicate.Decision | None:
+        """Run a predicate gate's rules. `None` means escalate to the model."""
+        source = node.source if node.source is not None else "{{ input }}"
+        text = template.render(source, context)
+        decision = predicate.evaluate(node.rules, text)
+        if decision.matched:
+            return decision
+        if node.default:
+            return predicate.Decision(
+                choice=node.default, reason=f"{decision.reason}; using default"
+            )
+        return None
 
     async def _call_model(
         self,
@@ -466,7 +613,14 @@ class Runner:
         visit: int,
     ) -> LLMResponse:
         graph = self.graph
-        prompt = template.render(node.prompt or "", context)
+        budget = (
+            node.max_input_chars
+            if node.max_input_chars is not None
+            else graph.defaults.max_input_chars
+        )
+        prompt = template.truncate_middle(
+            template.render(node.prompt or "", context), budget
+        )
         system = node.system if node.system is not None else graph.defaults.system
         system = template.render(system, context) if system else None
 
@@ -474,8 +628,15 @@ class Runner:
         if node.type == "gate":
             schema = schema or choice_schema(node.choices)
 
-        resident = node.type == "agent" and node.mode == "resident"
+        resident = node.type == "agent" and node.agent_mode == "resident"
         history = conversations.setdefault(node.id, []) if resident else []
+        if resident:
+            keep = node.keep_last if node.keep_last is not None else graph.defaults.keep_last
+            if keep is not None and len(history) > keep * 2:
+                # One exchange is a user turn plus its assistant reply. Dropping
+                # from the front keeps the most recent attempts, which is what a
+                # revision loop actually needs.
+                del history[: len(history) - keep * 2]
         messages = [*history, {"role": "user", "content": prompt}]
 
         request = LLMRequest(
@@ -539,6 +700,7 @@ class Runner:
         task: str,
         variables: dict[str, Any],
         results: dict[str, NodeResult],
+        state: dict[str, Any],
         visit: int,
     ) -> dict[str, Any]:
         return {
@@ -546,6 +708,7 @@ class Runner:
             "node": node.id,
             "iteration": visit,
             "vars": variables,
+            "state": state,
             "inputs": {k: v.text for k, v in inbox.items()},
             "data": {k: (v.data or {}) for k, v in inbox.items()},
             "input": self._joined(inbox),

@@ -8,6 +8,18 @@ runs it: fanning out to parallel reviewers, waiting on joins, routing on gate
 decisions, looping back on failure, and stopping when a visit budget runs out.
 Then it hands you the trace and a diagram of the path it actually took.
 
+It is built to be depended on. One import and one call from any project:
+
+```python
+from graph_looper import run
+
+result = run("reviewer-loop", "Write a 200-word explainer on tail risk.")
+print(result.output)
+```
+
+The full public interface and its stability promise are in
+**[docs/API.md](docs/API.md)**.
+
 ```mermaid
 flowchart LR
   task(["Task"])
@@ -66,11 +78,38 @@ verdict.
 ## Install
 
 ```bash
-pip install -e .
+pip install -e .                                                 # from a clone
+pip install git+https://github.com/50thycal/graph_looper.git     # from anywhere
 ```
 
 Credentials resolve the way the Anthropic SDK resolves them: `ANTHROPIC_API_KEY`,
 `ANTHROPIC_AUTH_TOKEN`, or a profile from `ant auth login`.
+
+## Use it from another project
+
+`load()` takes whatever form your graph is already in — a name, a path, YAML
+text, a dict, or a `Graph` — so there is nothing to convert:
+
+```python
+from graph_looper import FileStateStore, run
+
+result = run(
+    "review",                        # a name on your GRAPHLOOPER_PATH…
+    document,                        # …or a path, YAML text, or a dict
+    state=FileStateStore("state.json"),
+    variables={"tone": "direct"},
+    search_paths=["workflows"],
+)
+
+print(result.output)                 # the terminal node's text
+print(result.text_of("synthesize"))  # any node's output
+print(result.costliest(3))           # which node spent the most
+result.raise_for_status()            # or check result.ok yourself
+```
+
+Point it at your own graphs with `GRAPHLOOPER_PATH` (same shape as `PATH`) or
+`search_paths=`. `arun()` is the async form. The package ships `py.typed`, so
+your type checker sees everything.
 
 ## Use it
 
@@ -177,7 +216,7 @@ edges:
 |-------------|--------------|
 | `input`     | Entry point. Receives the run's task. |
 | `agent`     | An LLM call. `mode: ephemeral` (default) or `resident`. |
-| `gate`      | An LLM call constrained to pick one of `choices`; edges route on the pick. |
+| `gate`      | A branch. `mode: llm` (default) asks the model; `mode: predicate` decides locally. |
 | `transform` | No model call. `op:` `concat` · `first` · `last` · `template` · `json`. |
 | `output`    | Terminal. Its text is the run's result. |
 
@@ -185,6 +224,48 @@ Agent and gate nodes also take `model`, `max_tokens`, `effort`, `system`,
 `thinking: false`, and `output_schema` (a JSON schema — the node then returns
 parsed structured output, and `label_from: data.<key>` lets a plain agent route
 like a gate).
+
+### Gates that cost nothing
+
+Most branches are not judgement calls. A predicate gate decides from local rules
+at zero tokens, and only falls through to the model when nothing matches *and*
+no `default` is set:
+
+```yaml
+- id: classify
+  type: gate
+  mode: predicate
+  choices: [bug, billing, question]
+  on_exhausted: question
+  source: "{{ task }}"          # what to match against; defaults to {{ input }}
+  rules:
+    - contains: [refund, invoice, charge]
+      choice: billing
+    - matches: '\b(error|crash|broken|500)\b'
+      choice: bug
+  prompt: |                     # reached only when no rule matched
+    Keyword routing did not settle this. Classify it: ...
+```
+
+Matchers are `contains` (any of a list, case-insensitive), `matches` (regex),
+`equals`, `not_empty`, and `always`. First match wins. Regexes are compiled at
+load time, so a bad one fails before the run starts rather than three nodes in.
+
+Set `default:` instead of a `prompt` and the gate never reaches the model at all.
+
+### Keeping a lid on context
+
+A resident agent otherwise carries every draft it has ever written into the next
+call, which is how a long loop quietly turns into a very expensive one.
+
+```yaml
+defaults:
+  keep_last: 2            # resident agents keep the last 2 exchanges
+  max_input_chars: 20000  # rendered prompts are trimmed from the middle
+```
+
+Both can be set per node. `graphloop run --cost` prints tokens by node across
+every visit, so you can see which node is the pile.
 
 ### Joins — the part that makes loops work
 
@@ -230,6 +311,7 @@ so JSON examples in a prompt survive untouched.
 | `{{ data.<node>.<key> }}` | a structured field from an upstream node |
 | `{{ iteration }}` | this node's visit count |
 | `{{ vars.<key> }}` | a variable from `--var key=value` |
+| `{{ state.<key> }}` | something a previous **run** recorded |
 
 Unknown paths render empty. That is deliberate: on the first pass through a
 loop, `{{ results.synthesize }}` has nothing in it yet, and that is not an error.
@@ -238,6 +320,59 @@ Use `inputs.` when a node should react to what just arrived, and `results.` when
 it needs the latest of something that arrived on a different pass — which is why
 the worker reads `{{ results.planner }}` for the plan and `{{ results.synthesize }}`
 for the feedback.
+
+## State: what survives between runs
+
+Without a store, every run starts cold — if the same reviewer raises the same
+complaint on ten consecutive runs, nothing anywhere learns it. A store lets a
+graph compound.
+
+```yaml
+- id: lesson
+  type: agent
+  writes_state: lessons     # the key it contributes
+  state_append: true        # push onto a list rather than replacing
+  state_limit: 10           # keep the most recent 10 — a note, not a transcript
+  prompt: "In one sentence, what should we avoid next time?"
+
+- id: writer
+  type: agent
+  prompt: |
+    Recurring problems worth avoiding up front:
+    {{ state.lessons }}
+    ...
+```
+
+```bash
+graphloop run draft-critique -i "First brief."  --state
+graphloop run draft-critique -i "Second brief." --state   # reads run one's lesson
+```
+
+The bare `--state` flag uses `.graphloop/state.json`; give it a path to put it
+elsewhere. From code, pass `state=` a path, a `FileStateStore`, a
+`MemoryStateStore`, or your own object with `load`/`save`.
+
+**Nothing is written unless you ask.** The default is no persistence, so
+importing this library never leaves files in someone's working directory. The
+engine also records `_runs`, `_last_ok`, `_last_output` and `_last_error` on
+every run, including failed ones — a run that dies halfway still keeps whatever
+its finished nodes wrote.
+
+## Lint: nodes that do not earn their place
+
+`validate` proves a graph *can* run. `lint` asks whether every node is pulling
+its weight — it runs automatically as part of `validate`:
+
+```bash
+graphloop validate my-graph            # warnings on stderr
+graphloop validate my-graph --strict   # exit 1 if there are any
+```
+
+It catches a node whose output no prompt ever reads (it runs, it bills you, the
+result is dropped), a `{{ inputs.x }}` with no edge behind it that will always
+render blank, state written but never read back, and unused vars. The
+`author` command lints what it generates, which is where these mistakes are
+most likely.
 
 ## Generating a graph from a sketch
 
@@ -252,21 +387,21 @@ Claude reads the description or the photo, emits a graph, and the result is
 validated. If validation fails, the errors are handed back for another attempt —
 so what lands on disk is a graph that runs, not a plausible-looking one.
 
-## Using it as a library
+## Driving the engine directly
+
+`run()` covers most cases; reach for `Runner` when you want to hold the object.
 
 ```python
-from graph_looper import AnthropicProvider, Runner, load_graph
+from graph_looper import Graph, MemoryStateStore, Runner
 
-graph = load_graph("graph_looper/graphs/reviewer-loop.yaml")
-result = Runner(graph, AnthropicProvider()).run("Write the explainer.")
+graph = Graph.from_file("workflows/review.yaml")
+runner = Runner(graph, state=MemoryStateStore())   # provider defaults to Anthropic
 
-print(result.output)
-print(result.results["synthesize"].text)
-for event in result.trace.events:
-    print(event.kind, event.node)
+result = runner.run("Write the explainer.")
+print(result.output, result.usage_by_node)
 ```
 
-`Runner.arun` is the async form. Pass `on_event=` for live progress.
+Full reference: **[docs/API.md](docs/API.md)**.
 
 ## Development
 
@@ -283,12 +418,18 @@ effort, structured-output schema, refusal handling) against a fake client.
 
 ```
 graph_looper/
+  api.py        the public entry points — run, load, lint, to_mermaid
   spec.py       graph parsing and validation
   runtime.py    the execution engine — scheduling, joins, loops, budgets
+  state.py      persistence between runs
+  predicate.py  rule matching for gates that skip the model
+  lint.py       warnings about nodes that do not earn their place
+  catalog.py    finding graphs by name
   providers.py  Anthropic and mock providers
   template.py   the {{ path }} renderer
   render.py     Mermaid and text output
   author.py     graph generation from a description or an image
   cli.py        the graphloop command
   graphs/       bundled example graphs
+docs/API.md     the public interface and its stability promise
 ```

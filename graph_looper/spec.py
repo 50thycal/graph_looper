@@ -8,16 +8,22 @@ bounded by per-node visit budgets rather than by acyclicity.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable
+from typing import TYPE_CHECKING, Any, Iterable
+
+if TYPE_CHECKING:  # pragma: no cover - import cycle guard
+    from graph_looper.lint import LintWarning
 
 import yaml
 
 NODE_TYPES = ("input", "agent", "gate", "transform", "output")
 JOIN_MODES = ("all", "any")
 AGENT_MODES = ("ephemeral", "resident")
+GATE_MODES = ("llm", "predicate")
 TRANSFORM_OPS = ("concat", "first", "last", "template", "json")
+MATCHERS = ("contains", "matches", "equals", "not_empty", "always")
 
 DEFAULT_MODEL = "claude-opus-5"
 DEFAULT_MAX_TOKENS = 8000
@@ -55,7 +61,7 @@ class Node:
     # Display
     title: str | None = None
     # Agent / gate
-    mode: str = "ephemeral"  # ephemeral | resident (agents only)
+    mode: str | None = None  # agents: ephemeral | resident. gates: llm | predicate
     system: str | None = None
     prompt: str | None = None
     model: str | None = None
@@ -67,19 +73,53 @@ class Node:
     choices: list[str] = field(default_factory=list)
     max_visits: int | None = None
     on_exhausted: str | None = None
+    # Gate, predicate mode
+    rules: list[dict[str, Any]] = field(default_factory=list)
+    default: str | None = None
+    source: str | None = None
     # Transform
     op: str = "concat"
     separator: str = "\n\n"
     # Routing
     join: str = "all"
     label_from: str | None = None
+    # Persistence
+    writes_state: str | None = None
+    state_append: bool = False
+    state_limit: int | None = None
+    # Context budget
+    keep_last: int | None = None
+    max_input_chars: int | None = None
 
     @property
     def label(self) -> str:
         return self.title or self.id.replace("_", " ")
 
+    @property
+    def agent_mode(self) -> str:
+        """`ephemeral` (fresh context each visit) or `resident` (keeps its own)."""
+        return self.mode or "ephemeral"
+
+    @property
+    def gate_mode(self) -> str:
+        """`llm` (ask the model) or `predicate` (decide with local rules)."""
+        return self.mode or "llm"
+
     def is_llm(self) -> bool:
+        """Node types that *can* reach the model."""
         return self.type in ("agent", "gate")
+
+    def calls_model(self) -> bool:
+        """Whether it actually will.
+
+        A predicate gate with a `default` never does — that is the whole point
+        of it, and it means such a node needs no prompt.
+        """
+        if self.type == "agent":
+            return True
+        if self.type == "gate":
+            return self.gate_mode == "llm" or not self.default
+        return False
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> "Node":
@@ -103,6 +143,17 @@ class Node:
             data["choices"] = [_as_label(c) for c in data["choices"]]
         if "on_exhausted" in data:
             data["on_exhausted"] = _as_label(data["on_exhausted"])
+        if "default" in data:
+            data["default"] = _as_label(data["default"])
+        if "rules" in data:
+            if not isinstance(data["rules"], list):
+                raise GraphError(f"node {node_id!r}: 'rules' must be a list")
+            data["rules"] = [
+                {**r, "choice": _as_label(r["choice"])}
+                if isinstance(r, dict) and "choice" in r
+                else r
+                for r in data["rules"]
+            ]
         return cls(**data)
 
     def to_dict(self) -> dict[str, Any]:
@@ -166,6 +217,10 @@ class Defaults:
     effort: str = DEFAULT_EFFORT
     max_visits: int = DEFAULT_MAX_VISITS
     system: str | None = None
+    #: Resident agents keep at most this many exchanges. None keeps everything.
+    keep_last: int | None = None
+    #: Rendered prompts are trimmed to this many characters. None never trims.
+    max_input_chars: int | None = None
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any] | None) -> "Defaults":
@@ -204,6 +259,8 @@ class Graph:
 
     def __post_init__(self) -> None:
         self._by_id = {n.id: n for n in self.nodes}
+        #: Where this graph was loaded from, when it came off disk.
+        self.path: Path | None = getattr(self, "path", None)
 
     # -- lookup helpers -------------------------------------------------
 
@@ -291,6 +348,40 @@ class Graph:
     def to_yaml(self) -> str:
         return yaml.safe_dump(self.to_dict(), sort_keys=False, width=100)
 
+    def to_file(self, path: str | Path) -> Path:
+        """Write this graph out as YAML (or JSON, by suffix)."""
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.suffix.lower() == ".json":
+            path.write_text(json.dumps(self.to_dict(), indent=2) + "\n")
+        else:
+            path.write_text(self.to_yaml())
+        return path
+
+    @classmethod
+    def from_file(cls, path: str | Path) -> "Graph":
+        """Load and validate a graph from a `.yaml`/`.yml`/`.json` file."""
+        return load_graph(path)
+
+    @classmethod
+    def from_yaml(cls, text: str) -> "Graph":
+        """Load and validate a graph from a YAML string."""
+        return load_graph_str(text)
+
+    @classmethod
+    def from_json(cls, text: str) -> "Graph":
+        """Load and validate a graph from a JSON string."""
+        return load_graph_str(text, fmt="json")
+
+    def lint(self) -> list["LintWarning"]:
+        """Non-fatal warnings — nodes nothing reads, references that never fill.
+
+        See `graph_looper.lint` for the checks.
+        """
+        from graph_looper.lint import lint as run_lint
+
+        return run_lint(self)
+
     # -- validation -----------------------------------------------------
 
     def validate(self) -> None:
@@ -328,11 +419,13 @@ class Graph:
             errors.append(f"{where}: type must be one of {', '.join(NODE_TYPES)}")
         if node.join not in JOIN_MODES:
             errors.append(f"{where}: join must be one of {', '.join(JOIN_MODES)}")
-        if node.type == "agent" and node.mode not in AGENT_MODES:
+        if node.type == "agent" and node.agent_mode not in AGENT_MODES:
             errors.append(f"{where}: mode must be one of {', '.join(AGENT_MODES)}")
-        if node.is_llm() and not node.prompt:
+        if node.calls_model() and not node.prompt:
             errors.append(f"{where}: {node.type} nodes need a 'prompt'")
         if node.type == "gate":
+            if node.gate_mode not in GATE_MODES:
+                errors.append(f"{where}: mode must be one of {', '.join(GATE_MODES)}")
             if len(node.choices) < 2:
                 errors.append(f"{where}: gate needs at least two 'choices'")
             if not all(isinstance(c, str) for c in node.choices):
@@ -347,6 +440,25 @@ class Graph:
                     f"{where}: gate needs 'on_exhausted' naming the choice to force "
                     "once its visit budget is spent"
                 )
+            if node.default and node.default not in node.choices:
+                errors.append(
+                    f"{where}: default {node.default!r} is not one of {node.choices}"
+                )
+            errors.extend(self._validate_rules(node))
+        if node.type != "gate" and (node.rules or node.default):
+            errors.append(f"{where}: 'rules' and 'default' only apply to gates")
+        if node.state_limit is not None and node.state_limit < 1:
+            errors.append(f"{where}: state_limit must be >= 1")
+        if node.state_append and not node.writes_state:
+            errors.append(f"{where}: state_append needs 'writes_state'")
+        if node.writes_state and node.writes_state.startswith("_"):
+            errors.append(
+                f"{where}: state keys starting with '_' are reserved for the engine"
+            )
+        if node.keep_last is not None and node.keep_last < 1:
+            errors.append(f"{where}: keep_last must be >= 1")
+        if node.max_input_chars is not None and node.max_input_chars < 1:
+            errors.append(f"{where}: max_input_chars must be >= 1")
         if node.type == "transform" and node.op not in TRANSFORM_OPS:
             errors.append(f"{where}: op must be one of {', '.join(TRANSFORM_OPS)}")
         if node.type == "transform" and node.op == "template" and not node.prompt:
@@ -361,6 +473,41 @@ class Graph:
             errors.append(f"{where}: no incoming edges — it can never fire")
         if node.type != "output" and not self.outgoing(node.id):
             errors.append(f"{where}: no outgoing edges — its result goes nowhere")
+        return errors
+
+    def _validate_rules(self, node: Node) -> list[str]:
+        """Predicate rules are compiled here so a bad regex fails at load time,
+        not three nodes into a live run."""
+        errors: list[str] = []
+        where = f"node {node.id!r}"
+        if node.gate_mode == "predicate" and not node.rules:
+            errors.append(f"{where}: a predicate gate needs 'rules'")
+        if node.rules and node.gate_mode != "predicate":
+            errors.append(f"{where}: 'rules' needs mode: predicate")
+        for index, rule in enumerate(node.rules):
+            at = f"{where}: rule {index + 1}"
+            if not isinstance(rule, dict):
+                errors.append(f"{at} must be a mapping")
+                continue
+            unknown = set(rule) - set(MATCHERS) - {"choice"}
+            if unknown:
+                errors.append(f"{at}: unknown key(s) {', '.join(sorted(unknown))}")
+            matchers = [m for m in MATCHERS if m in rule]
+            if len(matchers) != 1:
+                errors.append(
+                    f"{at} needs exactly one of {', '.join(MATCHERS)}, "
+                    f"got {len(matchers)}"
+                )
+            choice = rule.get("choice")
+            if choice is None:
+                errors.append(f"{at} needs a 'choice'")
+            elif choice not in node.choices:
+                errors.append(f"{at}: choice {choice!r} is not one of {node.choices}")
+            if "matches" in rule:
+                try:
+                    re.compile(str(rule["matches"]))
+                except re.error as exc:
+                    errors.append(f"{at}: 'matches' is not a valid regex ({exc})")
         return errors
 
     def _validate_routing(self) -> list[str]:
@@ -449,6 +596,8 @@ def load_graph(path: str | Path) -> Graph:
         raise GraphError(f"no such graph file: {path}")
     fmt = "json" if path.suffix.lower() == ".json" else "yaml"
     try:
-        return load_graph_str(path.read_text(), fmt=fmt)
+        graph = load_graph_str(path.read_text(), fmt=fmt)
     except GraphError as exc:
         raise GraphError(f"{path}: {exc}") from None
+    graph.path = path
+    return graph

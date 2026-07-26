@@ -9,33 +9,19 @@ import sys
 from pathlib import Path
 from typing import Sequence
 
-from graph_looper import render
+from graph_looper import catalog, render
+from graph_looper.lint import lint as lint_graph
 from graph_looper.providers import AnthropicProvider, MockProvider, Provider
 from graph_looper.runtime import Runner, Trace, TraceEvent
 from graph_looper.spec import GraphError, load_graph
+from graph_looper.state import DEFAULT_STATE_PATH
 
-BUNDLED = Path(__file__).parent / "graphs"
+# Kept as module-level names because earlier versions exposed them here.
+bundled_graphs = catalog.bundled
+resolve_graph = catalog.resolve
 
 
 # -- helpers ---------------------------------------------------------------
-
-
-def bundled_graphs() -> dict[str, Path]:
-    if not BUNDLED.is_dir():
-        return {}
-    return {p.stem: p for p in sorted(BUNDLED.glob("*.yaml"))}
-
-
-def resolve_graph(reference: str) -> Path:
-    """Accept a path, or the bare name of a bundled example."""
-    path = Path(reference)
-    if path.exists():
-        return path
-    bundled = bundled_graphs()
-    if reference in bundled:
-        return bundled[reference]
-    known = ", ".join(bundled) or "none installed"
-    raise GraphError(f"no graph at {reference!r}; bundled graphs: {known}")
 
 
 def parse_vars(pairs: Sequence[str]) -> dict[str, str]:
@@ -91,9 +77,20 @@ def write_out(path: str | None, text: str, *, what: str) -> None:
 def cmd_validate(args: argparse.Namespace) -> int:
     graph = load_graph(resolve_graph(args.graph))
     print(f"✓ {graph.name} is valid ({len(graph.nodes)} nodes, {len(graph.edges)} edges)")
+
+    warnings = lint_graph(graph)
+    for warning in warnings:
+        print(f"! {warning}", file=sys.stderr)
+
     if args.verbose:
         print()
         print(render.to_text(graph))
+
+    if warnings and args.strict:
+        print(
+            f"{len(warnings)} warning(s) and --strict was given", file=sys.stderr
+        )
+        return 1
     return 0
 
 
@@ -111,11 +108,11 @@ def cmd_viz(args: argparse.Namespace) -> int:
 
 
 def cmd_examples(args: argparse.Namespace) -> int:
-    graphs = bundled_graphs()
+    graphs = catalog.available()
     if not graphs:
-        print("no bundled graphs found", file=sys.stderr)
+        print("no graphs found", file=sys.stderr)
         return 1
-    for name, path in graphs.items():
+    for name, path in sorted(graphs.items()):
         try:
             description = load_graph(path).description or ""
         except GraphError:
@@ -151,7 +148,13 @@ def cmd_run(args: argparse.Namespace) -> int:
     if not quiet:
         print(f"▶ {graph.name}", file=sys.stderr)
 
-    runner = Runner(graph, provider, on_event=on_event)
+    runner = Runner(
+        graph,
+        provider,
+        state=args.state if args.state else None,
+        namespace=args.namespace,
+        on_event=on_event,
+    )
     result = runner.run(task, variables=parse_vars(args.var))
 
     if args.trace:
@@ -170,10 +173,21 @@ def cmd_run(args: argparse.Namespace) -> int:
         if not quiet:
             print(
                 f"■ {'done' if result.ok else 'failed'} · {result.steps} steps · "
-                f"{result.seconds:.1f}s · "
-                f"{result.input_tokens + result.output_tokens} tokens",
+                f"{result.seconds:.1f}s · {result.total_tokens} tokens",
                 file=sys.stderr,
             )
+            if args.cost:
+                print(file=sys.stderr)
+                print("  tokens by node (all visits):", file=sys.stderr)
+                for node_id, spend in result.costliest(limit=100):
+                    total = spend["input"] + spend["output"]
+                    free = spend["calls"] - spend["model_calls"]
+                    note = f", {free} free" if free else ""
+                    print(
+                        f"    {node_id:<24} {total:>8} tokens  "
+                        f"({spend['calls']} visits{note})",
+                        file=sys.stderr,
+                    )
             print(file=sys.stderr)
         if result.ok:
             print(result.output)
@@ -197,6 +211,8 @@ def cmd_author(args: argparse.Namespace) -> int:
             attempts=args.attempts,
         )
     )
+    for warning in graph.lint():
+        print(f"  ! {warning}", file=sys.stderr)
     for line in log:
         print(f"  {line}", file=sys.stderr)
     write_out(args.output, graph.to_yaml(), what="graph")
@@ -225,6 +241,21 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument(
         "--var", action="append", default=[], metavar="K=V", help="template variable"
     )
+    run.add_argument(
+        "--state",
+        nargs="?",
+        const=str(DEFAULT_STATE_PATH),
+        help=(
+            "persist state between runs; bare flag uses "
+            f"{DEFAULT_STATE_PATH}, or give a path"
+        ),
+    )
+    run.add_argument(
+        "--namespace", help="state key to use (defaults to the graph name)"
+    )
+    run.add_argument(
+        "--cost", action="store_true", help="print tokens spent per node"
+    )
     run.add_argument("--trace", help="write the full run trace as JSON here")
     run.add_argument("--viz", help="write a Mermaid diagram of the path taken here")
     run.add_argument("--json", action="store_true", help="print the result as JSON")
@@ -249,6 +280,9 @@ def build_parser() -> argparse.ArgumentParser:
     validate = sub.add_parser("validate", help="check a graph and describe it")
     validate.add_argument("graph")
     validate.add_argument("-v", "--verbose", action="store_true")
+    validate.add_argument(
+        "--strict", action="store_true", help="exit non-zero on lint warnings"
+    )
     validate.set_defaults(func=cmd_validate)
 
     author = sub.add_parser(
