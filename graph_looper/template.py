@@ -61,6 +61,25 @@ def stringify(value: Any) -> str:
     return json.dumps(value, indent=2, ensure_ascii=False)
 
 
+def truncate_middle(text: str, limit: int | None, *, head: float = 0.4) -> str:
+    """Trim *text* to *limit* characters, cutting from the middle.
+
+    The opening of a prompt carries the instructions and the end carries the
+    freshest material; the sag in the middle is what you can afford to lose.
+    """
+    if limit is None or limit <= 0 or len(text) <= limit:
+        return text
+    marker = "\n\n…[{} characters elided]…\n\n"
+    elided = len(text) - limit
+    notice = marker.format(elided)
+    room = max(limit - len(notice), 0)
+    if room <= 0:
+        return text[:limit]
+    head_chars = int(room * head)
+    tail_chars = room - head_chars
+    return text[:head_chars] + notice + (text[-tail_chars:] if tail_chars else "")
+
+
 def render(template: str, context: dict[str, Any], *, strict: bool = False) -> str:
     """Substitute every `{{ path }}` in *template* using *context*."""
     if not template:

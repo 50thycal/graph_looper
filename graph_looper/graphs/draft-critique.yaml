@@ -1,12 +1,16 @@
 name: draft-critique
 description: >-
   The smallest useful loop: a resident writer and an ephemeral critic, trading
-  drafts until a gate says it is good enough.
+  drafts until a gate says it is good enough — and remembering across runs
+  which mistakes keep coming back.
 
 defaults:
   model: claude-opus-5
   effort: medium
   max_visits: 3
+  # A resident writer otherwise carries every draft it has ever written into
+  # the next call. Two exchanges is enough to revise from.
+  keep_last: 2
 
 nodes:
   - id: brief
@@ -20,6 +24,9 @@ nodes:
     join: any
     prompt: |
       Brief: {{ task }}
+
+      Notes from earlier sessions — recurring problems worth avoiding up front:
+      {{ state.lessons }}
 
       Critique of your last draft (blank on the first pass):
       {{ results.critic }}
@@ -53,6 +60,25 @@ nodes:
       Choose "ship" if the critique is only preference or polish. Choose
       "revise" if it names something that fails the brief.
 
+  - id: lesson
+    type: agent
+    title: Record the lesson
+    effort: low
+    # This is what makes the graph compound: one line per run, read back by the
+    # writer next time. Bounded, so it stays a note and not a transcript.
+    writes_state: lessons
+    state_append: true
+    state_limit: 10
+    prompt: |
+      A draft went through {{ results.good_enough }} rounds of review. The final
+      critique was:
+
+      {{ inputs.good_enough }}
+
+      In one sentence, state the single mistake most worth avoiding next time
+      someone writes to a brief like this one. If nothing generalises beyond
+      this specific draft, reply exactly "none".
+
   - id: final
     type: output
     title: Final draft
@@ -70,5 +96,7 @@ edges:
     when: revise
     label: revise
   - from: good_enough
-    to: final
+    to: lesson
     when: ship
+  - from: lesson
+    to: final

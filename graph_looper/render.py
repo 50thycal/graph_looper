@@ -19,6 +19,7 @@ _STYLES = """  classDef io fill:#1f2933,stroke:#8899a6,color:#f5f7fa;
   classDef ephemeral fill:#ffffff,stroke:#5b6b7b,color:#1f2933;
   classDef resident fill:#e6f5ea,stroke:#2f8f4e,color:#12351f,stroke-width:2px;
   classDef gate fill:#3b2f10,stroke:#b8860b,color:#f7efd8;
+  classDef predicate fill:#e8f0f7,stroke:#3c6e91,color:#12293b;
   classDef transform fill:#eef2ff,stroke:#5566cc,color:#1a2050;
   classDef idle opacity:0.45,stroke-dasharray:4 3;"""
 
@@ -36,10 +37,11 @@ def _node_class(node: Node) -> str:
     if node.type in ("input", "output"):
         return "io"
     if node.type == "gate":
-        return "gate"
+        # A predicate gate costs nothing to cross; worth seeing at a glance.
+        return "predicate" if node.gate_mode == "predicate" else "gate"
     if node.type == "transform":
         return "transform"
-    return "resident" if node.mode == "resident" else "ephemeral"
+    return "resident" if node.agent_mode == "resident" else "ephemeral"
 
 
 def _node_caption(node: Node, visits: int | None) -> str:
@@ -127,14 +129,19 @@ def to_text(graph: Graph) -> str:
     for node in graph.nodes:
         bits: list[str] = [node.type]
         if node.type == "agent":
-            bits.append(node.mode)
+            bits.append(node.agent_mode)
         if node.type == "gate":
+            bits.append(node.gate_mode)
             bits.append("/".join(node.choices))
+            if node.gate_mode == "predicate":
+                bits.append(f"{len(node.rules)} rules, no model call")
             bits.append(f"budget {graph.max_visits_for(node)} → {node.on_exhausted}")
         if node.type == "transform":
             bits.append(node.op)
         if node.join != "all" and graph.incoming(node.id):
             bits.append(f"join {node.join}")
+        if node.writes_state:
+            bits.append(f"writes state.{node.writes_state}")
         lines.append(f"    {node.id:<22} {' · '.join(bits)}")
     lines.append("")
     lines.append(f"  edges ({len(graph.edges)}):")

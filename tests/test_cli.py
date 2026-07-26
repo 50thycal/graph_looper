@@ -22,7 +22,7 @@ def test_validate_reports_a_bad_graph(tmp_path, capsys):
 
 def test_unknown_graph_name_lists_the_bundled_ones(capsys):
     assert main(["validate", "no-such-graph"]) == 2
-    assert "bundled graphs: draft-critique" in capsys.readouterr().err
+    assert "Known graphs: draft-critique" in capsys.readouterr().err
 
 
 def test_examples_lists_graphs(capsys):

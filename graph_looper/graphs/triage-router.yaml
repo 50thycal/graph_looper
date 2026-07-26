@@ -1,7 +1,8 @@
 name: triage-router
 description: >-
   A loop-free shape for contrast: one classifier gate fanning out to three
-  specialists, each writing into the same reply.
+  specialists. The gate routes on local rules first and only asks the model
+  when nothing matches.
 
 defaults:
   model: claude-opus-5
@@ -15,15 +16,29 @@ nodes:
   - id: classify
     type: gate
     title: What kind of ticket
+    mode: predicate
     choices: [bug, billing, question]
     max_visits: 1
     on_exhausted: question
+    source: "{{ task }}"
+    # Most tickets announce themselves. Matching costs nothing, so try it
+    # before spending a model call on a decision a keyword already settles.
+    rules:
+      - contains: [refund, invoice, charge, billing, subscription, receipt]
+        choice: billing
+      - matches: '\b(error|crash|broken|fails?|500|traceback|stack trace)\b'
+        choice: bug
+      - matches: '^(how|what|where|when|why|can i|do you)\b'
+        choice: question
+    # No `default`, so an unmatched ticket falls through to the prompt below —
+    # cheap when it can be, careful when it has to be.
     prompt: |
       Ticket:
       {{ task }}
 
-      Classify it. "bug" is something broken, "billing" is anything about money
-      or accounts, "question" is everything else.
+      Keyword routing did not settle this one. Classify it: "bug" is something
+      broken, "billing" is anything about money or accounts, "question" is
+      everything else.
 
   - id: bug_handler
     type: agent
