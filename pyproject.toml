@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "graph-looper"
+version = "0.1.0"
+description = "Draw an agent workflow as a graph; run it as a real multi-agent loop."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "anthropic>=0.120.0",
+    "PyYAML>=6.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "pytest-asyncio>=0.23"]
+
+[project.scripts]
+graphloop = "graph_looper.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["graph_looper*"]
+
+[tool.setuptools.package-data]
+graph_looper = ["graphs/*.yaml"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
